@@ -54,20 +54,21 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'pois_near',
     description:
-      'Find OSM points of interest within a radius of a lat/lon. Pass an OSM key=value tag like "amenity=cafe", "shop=bakery", "tourism=museum", or just "amenity" to match any value. Returns nodes with names, tags, and coordinates.',
+      'Find OpenStreetMap points of interest (shops, amenities, businesses) near a location. Give a location either as latitude+longitude OR as a place name via "place" (e.g. place: "Göttingen, Germany" — auto-geocoded). For the category, pass a plain-English term ("bike rental", "pharmacy", "restaurant", "gas station", "ev charger", "hotel", "atm") or an exact OSM tag ("amenity=cafe", "shop=bakery"). Answers "find bike rental shops in <city>", "pharmacies near me", "restaurants around this point". Returns matching places with names, tags, and coordinates.',
     inputSchema: {
       type: 'object',
       properties: {
-        latitude: { type: 'number', description: 'Center latitude' },
-        longitude: { type: 'number', description: 'Center longitude' },
+        place: { type: 'string', description: 'Place name to search near, e.g. "Göttingen, Germany" or "downtown Portland OR". Auto-geocoded to coordinates. Provide this OR latitude+longitude.' },
+        latitude: { type: 'number', description: 'Center latitude (provide with longitude, OR use place)' },
+        longitude: { type: 'number', description: 'Center longitude (provide with latitude, OR use place)' },
         radius_m: { type: 'number', description: 'Search radius in metres (1-10000, default 1000)' },
         tag: {
           type: 'string',
-          description: 'OSM tag filter (e.g., "amenity=cafe", "shop", "tourism=museum")',
+          description: 'Category: a plain term like "bike rental", "pharmacy", "restaurant", "ev charger", or an exact OSM tag like "amenity=cafe", "shop=bakery", "tourism=museum".',
         },
         limit: { type: 'number', description: 'Max results (1-500, default 100)' },
       },
-      required: ['latitude', 'longitude', 'tag'],
+      required: ['tag'],
     },
   },
   {
@@ -113,7 +114,11 @@ function reqStr(args: Record<string, unknown>, key: string, example: string): st
 async function overpassPost(qql: string): Promise<OverpassResponse> {
   const res = await fetch(ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+      'User-Agent': 'Pipeworx-Overpass-MCP/0.1 (contact@mojibake.ai)',
+    },
     body: `data=${encodeURIComponent(qql)}`,
   });
   if (res.status === 429) {
@@ -144,13 +149,55 @@ interface OverpassResponse {
   elements?: OverpassElement[];
 }
 
+// Plain-English category → OSM key=value, so agents can pass "bike rental" or
+// "pharmacy" instead of knowing the exact OSM tag. Anything already containing
+// "=" or a bare key passes straight through parseTagFilter unchanged.
+const CATEGORY_ALIASES: Record<string, string> = {
+  'bike rental': 'amenity=bicycle_rental', 'bicycle rental': 'amenity=bicycle_rental',
+  'bike hire': 'amenity=bicycle_rental', 'fahrradverleih': 'amenity=bicycle_rental',
+  'bike shop': 'shop=bicycle', 'bicycle shop': 'shop=bicycle',
+  pharmacy: 'amenity=pharmacy', chemist: 'amenity=pharmacy', apotheke: 'amenity=pharmacy',
+  atm: 'amenity=atm', bank: 'amenity=bank', restaurant: 'amenity=restaurant',
+  cafe: 'amenity=cafe', coffee: 'amenity=cafe', bar: 'amenity=bar', pub: 'amenity=pub',
+  hotel: 'tourism=hotel', hostel: 'tourism=hostel', museum: 'tourism=museum',
+  supermarket: 'shop=supermarket', 'grocery store': 'shop=supermarket', bakery: 'shop=bakery',
+  hospital: 'amenity=hospital', clinic: 'amenity=clinic', doctor: 'amenity=doctors',
+  'gas station': 'amenity=fuel', 'petrol station': 'amenity=fuel', 'fuel station': 'amenity=fuel',
+  'ev charger': 'amenity=charging_station', 'charging station': 'amenity=charging_station',
+  'parking': 'amenity=parking', 'car park': 'amenity=parking', toilet: 'amenity=toilets',
+  'public toilet': 'amenity=toilets', 'post office': 'amenity=post_office',
+  school: 'amenity=school', university: 'amenity=university', library: 'amenity=library',
+  playground: 'leisure=playground', park: 'leisure=park', gym: 'leisure=fitness_centre',
+};
+
+function resolveTag(raw: string): string {
+  const t = raw.trim();
+  if (t.includes('=')) return t; // explicit OSM tag
+  const alias = CATEGORY_ALIASES[t.toLowerCase()];
+  return alias ?? t; // fall back to treating it as a bare OSM key
+}
+
 function parseTagFilter(tag: string): string {
-  const t = tag.trim();
+  const t = resolveTag(tag);
   if (t.includes('=')) {
     const [k, v] = t.split('=', 2);
     return `["${k.trim()}"="${v.trim()}"]`;
   }
   return `["${t}"]`;
+}
+
+// Geocode a place name to lat/lon via Nominatim (keyless; polite UA + single
+// result). Lets pois_near answer "bike rentals in Göttingen" in one shot
+// instead of requiring the caller to geocode first.
+async function geocodePlace(place: string): Promise<{ lat: number; lon: number; display: string }> {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(place)}`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Pipeworx-Overpass-MCP/0.1 (contact@mojibake.ai)', 'Accept-Language': 'en' },
+  });
+  if (!res.ok) throw new Error(`Geocoding "${place}" failed (Nominatim HTTP ${res.status}). Pass latitude/longitude directly instead.`);
+  const rows = (await res.json()) as Array<{ lat: string; lon: string; display_name: string }>;
+  if (!rows.length) throw new Error(`Could not geocode "${place}" — no match. Try a more specific place name, or pass latitude/longitude directly.`);
+  return { lat: Number(rows[0].lat), lon: Number(rows[0].lon), display: rows[0].display_name };
 }
 
 function normalizeElement(el: OverpassElement) {
@@ -177,8 +224,21 @@ async function rawQuery(qql: string) {
 }
 
 async function poisNear(args: Record<string, unknown>) {
-  const lat = args.latitude as number;
-  const lon = args.longitude as number;
+  if (args.tag === undefined || String(args.tag).trim() === '') {
+    throw new Error('pois_near requires a "tag" — an OSM tag like "amenity=cafe" or a plain category like "bike rental", "pharmacy", "restaurant".');
+  }
+  // Accept either latitude/longitude OR a place name (auto-geocoded).
+  let lat = args.latitude as number | undefined;
+  let lon = args.longitude as number | undefined;
+  let geocoded: string | undefined;
+  const place = (args.place ?? args.location ?? args.near) as string | undefined;
+  if ((lat === undefined || lon === undefined) && place) {
+    const g = await geocodePlace(String(place));
+    lat = g.lat; lon = g.lon; geocoded = g.display;
+  }
+  if (typeof lat !== 'number' || typeof lon !== 'number' || Number.isNaN(lat) || Number.isNaN(lon)) {
+    throw new Error('pois_near needs a location: pass latitude+longitude, or a place name via "place" (e.g. place: "Göttingen, Germany").');
+  }
   const radius = Math.min(10000, Math.max(1, (args.radius_m as number) ?? 1000));
   const limit = Math.min(500, Math.max(1, (args.limit as number) ?? 100));
   const filter = parseTagFilter(String(args.tag));
@@ -193,8 +253,10 @@ out center ${limit};`;
   const data = await overpassPost(qql);
   return {
     center: { latitude: lat, longitude: lon },
+    geocoded_from: geocoded,
     radius_m: radius,
     tag: args.tag,
+    resolved_tag: resolveTag(String(args.tag)),
     count: data.elements?.length ?? 0,
     elements: (data.elements ?? []).map(normalizeElement),
   };

@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-overpass",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenStreetMap Overpass MCP — programmatic queries against the OSM database",
   "type": "module",
   "main": "src/index.ts",
