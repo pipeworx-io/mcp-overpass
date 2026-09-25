@@ -1,20 +1,32 @@
 {
   "name": "@pipeworx/mcp-overpass",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "OpenStreetMap Overpass MCP — programmatic queries against the OSM database",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "bin": {
+    "mcp-overpass": "bin/cli.js"
+  },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "overpass"],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pipeworx-io/mcp-overpass"
+    "url": "git+https://github.com/pipeworx-io/mcp-overpass.git"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-a571636c946a46b7be5506baa9a2c2c69b89c167362f9c40a21892833ed960e2",
+    "sourceCommit": "adb69d997f82a62e8e22b594488c7d04a227db35"
   }
 }

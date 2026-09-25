@@ -2,7 +2,7 @@
 
 OpenStreetMap Overpass API MCP — programmatic OSM queries, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1476+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
 
 ## Tools
 
@@ -12,7 +12,15 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 
 ## Data source
 
-`https://overpass-api.de/api/interpreter` — POST Overpass QL, returns JSON. ~10k queries/day from the public pool.
+`https://overpass.kumi.systems/api/interpreter` — POST Overpass QL, returns JSON.
+
+kumi.systems is the PRIMARY, not the better-known `overpass-api.de`, and the
+order is measured (fleet #2036, 2026-09-15): overpass-api.de returns a 406 to
+every request we can make from our egress — both `Accept` values, no `Accept`,
+no User-Agent, and a bare `GET /api/status` — while returning 200 to all of
+them from a residential address. An IP block wearing a 406; no header or proxy
+hop recovers it. `overpass-api.de` is kept as the fallback, and a primary that
+refuses OR hangs falls through to it.
 
 ## Quick Start
 
@@ -58,9 +66,45 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1476+ data sources. The
+Both URLs reach the same gateway and the same 1679+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
+
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/overpass_query \
+  -H 'Content-Type: application/json' \
+  -d '{"qql":"[out:json][timeout:25]; area[\"name\"=\"Paris\"][admin_level=4]->.a; node[\"amenity\"=\"restaurant\"](area.a); out body;"}'
+```
+
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/overpass_query`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
+
+## Standalone (no gateway account)
+
+This package also runs as a local stdio MCP server — no Pipeworx account, no
+gateway round-trip:
+
+```json
+{
+  "mcpServers": {
+    "overpass": {
+      "command": "npx",
+      "args": ["-y", "@pipeworx/mcp-overpass"]
+    }
+  }
+}
+```
+
+Or run it directly to confirm it starts:
+
+```bash
+npx -y @pipeworx/mcp-overpass
+```
+
+It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
+for **only** this pack's tools — none of the shared meta-tools the gateway
+connection above adds. Same source, same tools, no ask_pipeworx routing.
 
 ## Using with ask_pipeworx
 
@@ -81,13 +125,3 @@ The gateway picks the right tool and fills the arguments automatically.
 ## License
 
 MIT
-
-## No MCP client? Call it over HTTP
-
-```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/overpass_query \
-  -H 'Content-Type: application/json' \
-  -d '{"qql":"[out:json][timeout:25]; area[\"name\"=\"Paris\"][admin_level=4]->.a; node[\"amenity\"=\"restaurant\"](area.a); out body;"}'
-```
-
-No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/overpass_query`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
