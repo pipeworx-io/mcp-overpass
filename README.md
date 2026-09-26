@@ -2,7 +2,7 @@
 
 OpenStreetMap Overpass API MCP — programmatic OSM queries, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
 
 ## Tools
 
@@ -12,15 +12,19 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 
 ## Data source
 
-`https://overpass.kumi.systems/api/interpreter` — POST Overpass QL, returns JSON.
+Public Overpass instances, POST Overpass QL, JSON back. Tried in order, and a
+host that refuses or hangs is skipped for five minutes:
 
-kumi.systems is the PRIMARY, not the better-known `overpass-api.de`, and the
-order is measured (fleet #2036, 2026-09-15): overpass-api.de returns a 406 to
-every request we can make from our egress — both `Accept` values, no `Accept`,
-no User-Agent, and a bare `GET /api/status` — while returning 200 to all of
-them from a residential address. An IP block wearing a 406; no header or proxy
-hop recovers it. `overpass-api.de` is kept as the fallback, and a primary that
-refuses OR hangs falls through to it.
+1. `https://overpass.kumi.systems/api/interpreter` — fast when up; dark since
+   ~2026-09-19 (hangs past 30s).
+2. `https://maps.mail.ru/osm/tools/overpass/api/interpreter` — full planet,
+   current data, but 13-17s per call.
+3. `https://overpass-api.de/api/interpreter` — the canonical instance; 406s our
+   egress today (an IP block, fleet #2036), kept in case that changes.
+
+The order, the measurements and the mirrors ruled out live in
+`shared/src/overpass.ts` (fleet #2451). When every host fails, the error names
+what each one did.
 
 ## Quick Start
 
@@ -66,7 +70,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1683+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

@@ -452,7 +452,42 @@ async function fetchWithTimeout(
         ),
       );
     }
-    throw err;
+    // Fleet #2382. Everything that isn't a timeout/abort here is a genuine
+    // NETWORK-LEVEL failure — DNS resolution, connection refused, TLS handshake,
+    // Cloudflare's own "Network connection lost." — meaning `fetch()` itself
+    // threw and no HTTP response of any kind was ever received. Until this fix
+    // that raw exception was rethrown VERBATIM: a bare `TypeError: fetch failed`
+    // (or the Workers-runtime equivalent) names no upstream, carries no class
+    // token, and reads exactly like a defect in OUR code — because it says
+    // nothing about the call at all. It landed in `error`, the tier that means
+    // "Pipeworx has a defect", for every one of the (at the time of writing)
+    // ~470 packs that call this helper directly with no wrapper of their own.
+    //
+    // `dexscreener` hit this independently (fleet #1579) and fixed it with a
+    // bespoke per-pack try/catch around `fetchWithTimeout`. That fix is correct
+    // but only covers one pack; every other caller of this shared helper still
+    // leaked the raw exception. Moving the same fix HERE — the one place that
+    // already carries the timeout case — covers every pack that uses
+    // `fetchWithTimeout` without a wrapper, for free, and without widening
+    // `classifyToolError`'s regex list: the fix is giving the message a proper
+    // `upstream_down:` token at the point the two facts (no response was ever
+    // received, and which host we were trying to reach) are actually in hand,
+    // not teaching the classifier to guess from prose after the fact.
+    //
+    // Safe on the same grounds as the timeout branch above: no argument a
+    // caller passes can make `fetch()` itself throw a connection-level error,
+    // so this is always an availability failure, never a caller mistake. Same
+    // `markInternalOrigin` treatment — an origin we run that never answered is
+    // still ours, not a third party's outage.
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      markInternalOrigin(
+        `upstream_down: could not reach ${name} at all (${raw.slice(0, 160)}). ` +
+          `No request reached ${name}, so this says NOTHING about whether the arguments you passed ` +
+          'are valid — do not re-check them on the strength of this error. Retry shortly.',
+        url,
+      ),
+    );
   }
 }
 
@@ -635,6 +670,132 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+
+/**
+ * Overpass host failover, shared by every pack that queries OpenStreetMap
+ * Overpass (`overpass`, `geo-reconcile`). Fleet #2451.
+ *
+ * Public Overpass is a handful of volunteer instances, and from our egress
+ * (Cloudflare Worker IPs, and the Supabase egress relay) at most one or two of
+ * them answer at any time. Measured 2026-09-26, one POST per host, same
+ * `amenity=cafe` query:
+ *
+ *   overpass.kumi.systems  CNAME of overpass.private.coffee. /api/interpreter
+ *                          hangs past 30s (the site root answers 404 in 0.5s,
+ *                          so the host is up and the Overpass backend is not).
+ *                          It had been the only host answering our relay
+ *                          (#2036); it went dark ~09-19 and took both packs
+ *                          with it, because the only fallback was the next one.
+ *   overpass-api.de        200 from a residential address, but a 371-byte
+ *                          Apache 406 to the relay's IPs under every request
+ *                          shape (an IP block, #2036) and 429/521 to CF egress.
+ *   maps.mail.ru           200 with current data (timestamp_osm_base within a
+ *                          minute of now) for Paris AND New York — a full
+ *                          planet, not a regional extract — but slow: 13-17s,
+ *                          and /api/status alone takes ~17s, so the latency is
+ *                          the front end, not the query.
+ *
+ * Ruled out, so nobody re-probes them: overpass.osm.ch (Switzerland-only
+ * extract: 200 with ZERO elements elsewhere — a silent-zero trap),
+ * overpass.monicz.dev and overpass.openstreetmap.ru (timeout), overpass.osm.jp
+ * (TLS failure), lz4.overpass-api.de (504), overpass.openstreetmap.fr (403
+ * whitelist-only).
+ *
+ * So the order is: the host that USED to serve us fast, then the slow host that
+ * serves us now, then the canonical instance in case our egress ever changes.
+ * A host that hangs or refuses is benched for a few minutes per isolate, so the
+ * dead one costs its timeout once, not on every call — without that, a dead
+ * kumi would put 12s in front of every answer.
+ */
+
+interface OverpassHost {
+  /** Short name for errors and `served_by`. */
+  name: string;
+  url: string;
+  /** Per-attempt bound. A hang and a refusal both mean "ask the next host". */
+  timeoutMs: number;
+}
+
+const OVERPASS_HOSTS: readonly OverpassHost[] = [
+  { name: 'overpass.kumi.systems', url: 'https://overpass.kumi.systems/api/interpreter', timeoutMs: 12_000 },
+  { name: 'maps.mail.ru', url: 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', timeoutMs: 25_000 },
+  { name: 'overpass-api.de', url: 'https://overpass-api.de/api/interpreter', timeoutMs: 5_000 },
+];
+
+/**
+ * Statuses that mean THIS HOST is refusing us rather than that the QUERY is
+ * wrong. Only these move on to the next host: a 400 is malformed QL and a 504 is
+ * a query too big for any server, and re-running either on another volunteer
+ * host doubles the load to get the same answer. 403 also covers the egress
+ * relay's own `host_not_allowed`.
+ */
+const OVERPASS_HOST_REFUSED: ReadonlySet<number> = new Set([403, 406, 429, 502, 503, 521]);
+
+/** How long a host that hung or refused is skipped (per isolate). */
+const OVERPASS_BENCH_MS = 5 * 60_000;
+
+const benchedUntil = new Map<string, number>();
+
+/** Test hook: forget every benched host. */
+function resetOverpassBench(): void {
+  benchedUntil.clear();
+}
+
+interface OverpassAnswer {
+  res: Response;
+  /** Which host produced `res`. */
+  served_by: string;
+}
+
+/**
+ * Send one Overpass request, failing over across OVERPASS_HOSTS.
+ *
+ * `send` performs the actual request (relay or direct — that is the pack's
+ * business) against `url` within `timeoutMs`, and may throw on timeout.
+ *
+ * Returns the first response that is not a host refusal — including a 400 or
+ * 504, which the caller reports as a query problem. When every host refuses or
+ * hangs, throws an Error naming what each host did, so the caller sees "kumi
+ * timed out; mail.ru 406; overpass-api.de 406" rather than one opaque HTML
+ * error page that reads as a malformed query.
+ */
+async function postOverpass(
+  send: (url: string, timeoutMs: number) => Promise<Response>,
+  now: () => number = Date.now,
+): Promise<OverpassAnswer> {
+  const t = now();
+  const live = OVERPASS_HOSTS.filter((h) => (benchedUntil.get(h.name) ?? 0) <= t);
+  // Everything benched means the bench knows nothing current: try them all.
+  const order = live.length > 0 ? live : OVERPASS_HOSTS;
+  const attempts: string[] = [];
+  let rateLimited = false;
+
+  for (const host of order) {
+    let res: Response;
+    try {
+      res = await send(host.url, host.timeoutMs);
+    } catch (e) {
+      benchedUntil.set(host.name, now() + OVERPASS_BENCH_MS);
+      attempts.push(`${host.name}: ${e instanceof Error ? e.message : String(e)}`);
+      continue;
+    }
+    if (OVERPASS_HOST_REFUSED.has(res.status)) {
+      benchedUntil.set(host.name, now() + OVERPASS_BENCH_MS);
+      if (res.status === 429) rateLimited = true;
+      attempts.push(`${host.name}: HTTP ${res.status}`);
+      try { await res.body?.cancel(); } catch { /* already consumed */ }
+      continue;
+    }
+    benchedUntil.delete(host.name);
+    return { res, served_by: host.name };
+  }
+
+  throw new Error(
+    `Overpass: no public Overpass instance answered${rateLimited ? ' (one is rate-limiting — try again shortly)' : ''}. ` +
+      `${attempts.join('; ')}.`,
+  );
+}
 /**
  * OpenStreetMap Overpass MCP — programmatic queries against the OSM database
  *
@@ -660,46 +821,11 @@ async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs?: number
     : fetchWithTimeout(url, init ?? {}, 'OpenStreetMap Overpass', timeoutMs);
 }
 
-// PRIMARY is kumi.systems, NOT the main overpass-api.de instance, and that
-// ordering is measured rather than preferred (fleet #2036, 2026-09-15).
-//
-// overpass-api.de refuses BOTH of our egresses and cannot be made to answer by
-// changing the request. Probed from a throwaway edge function on the relay's
-// own egress, varying one thing at a time:
-//   Accept: application/json  -> 406 in 0.66s      Accept: */*  -> 406 in 0.71s
-//   no Accept header at all   -> 406 in 0.62s      no UA        -> 406 in 0.66s
-//   GET /api/status (no body) -> 406 in 0.68s
-//   z.overpass-api.de -> 406      lz4.overpass-api.de -> 406
-// Five request shapes, two named backends, one 371-byte Apache error page every
-// time. A GET of /api/status returning 406 is the tell: that endpoint has no
-// content to negotiate, so this is an IP block wearing a 406, not content
-// negotiation. The control holds it to the IP — from a residential address the
-// same requests return 200 under every Accept and every Accept-Encoding, and no
-// variant produced a 406 at all. Cloudflare Worker egress is refused too (429
-// then 521, measured 2026-09-04). So there is no header, UA, or relay hop that
-// recovers this host; only a different source address would.
-//
-// kumi.systems, from that same relay egress: HTTP 200 in 1.3s with real
-// elements. It is therefore the only upstream we can actually reach, which is
-// why it leads.
-const ENDPOINT = 'https://overpass.kumi.systems/api/interpreter';
-
-// FALLBACK, kept rather than deleted. It is dead weight from the relay today
-// (the 406 above) but costs only ~0.7s to learn that, it is the canonical
-// instance if our egress ever changes, and the fallback path below is what
-// covers the real risk here: kumi is a single volunteer host and it WAS down
-// for part of 2026-09-15 — 25s abort from the relay, 35s from a laptop — which
-// is precisely the window in which overpass_query returned 25s timeouts.
-//
-// Mirrors ruled out on the way, so nobody re-probes them (all from relay
-// egress, 2026-09-15): overpass.osm.ch answers 200 with ZERO elements for a San
-// Francisco query — a Switzerland-only extract, i.e. a silent-zero trap, not a
-// mirror; overpass.monicz.dev answers but its data is two months stale
-// (timestamp_osm_base 2026-07-15); overpass.openstreetmap.fr returns 403 "This
-// service is only available to white-listed usages"; overpass.private.coffee
-// and maps.mail.ru time out; overpass.osm.jp has an expired certificate;
-// overpass.nchc.org.tw and api.openstreetmap.fr do not resolve.
-const MIRROR = 'https://overpass-api.de/api/interpreter';
+// WHICH Overpass hosts, in what order, and why: shared/src/overpass.ts
+// (postOverpass). It used to live here as kumi.systems -> overpass-api.de, and
+// when kumi went dark (~2026-09-19) the only fallback was a host that 406s our
+// relay, so every call failed with that host's error page (fleet #2451). The
+// measurements behind the #2036 ordering are kept in that file's history.
 
 // Both upstreams refuse Cloudflare Worker egress while answering normally from
 // anywhere else, so calls are relayed through the egress proxy when the gateway
@@ -707,13 +833,6 @@ const MIRROR = 'https://overpass-api.de/api/interpreter';
 // refuse an unidentified client regardless of source address, which would move
 // the failure rather than remove it.
 const UA = 'Pipeworx-Overpass-MCP/0.1 (contact@mojibake.ai)';
-
-// Two attempts have to fit inside the budget one attempt used to get, or a
-// fallback buys availability by making every slow query fail. The primary keeps
-// the bulk of it; the fallback gets little because when this host answers at all
-// it answers fast, and when it refuses us it refuses in under a second.
-const PRIMARY_TIMEOUT_MS = 20_000;
-const FALLBACK_TIMEOUT_MS = 5_000;
 
 // Set per call from the gateway's _proxyUrl/_proxyToken (see callTool).
 let PROXY: { url: string; token: string } | null = null;
@@ -848,62 +967,15 @@ async function postTo(endpoint: string, body: string, timeoutMs: number): Promis
   );
 }
 
-/**
- * Statuses that mean THIS HOST is refusing us rather than that the QUERY is
- * wrong. Only these fall through to the mirror: a 400 is a malformed QQL and a
- * 504 is a query too big for any server, and retrying either on a second host
- * doubles the load on a volunteer service to produce the same answer twice.
- */
-const HOST_REFUSED = new Set([403, 406, 429, 502, 503, 521]);
-
 async function overpassPost(qql: string): Promise<OverpassResponse> {
   const body = `data=${encodeURIComponent(qql)}`;
-
-  // A REFUSAL and a HANG both mean "ask the other host". Only the first used to
-  // fall through, and the second is the one that actually took the pack down:
-  // when kumi was unreachable on 2026-09-15 the primary threw on timeout, which
-  // escaped this function entirely, so the fallback was never consulted and
-  // every call died at the timeout — with an error naming Overpass as slow when
-  // a second host was sitting there answering. Fleet #2036.
-  let res: Response | null = null;
-  let primaryThrew: unknown = null;
-  try {
-    res = await postTo(ENDPOINT, body, PRIMARY_TIMEOUT_MS);
-  } catch (e) {
-    primaryThrew = e;
-  }
-
-  if (primaryThrew !== null || (res !== null && HOST_REFUSED.has(res.status))) {
-    const primaryRes = res;
-    try {
-      const fallbackRes = await postTo(MIRROR, body, FALLBACK_TIMEOUT_MS);
-      // Keep whichever answered. When BOTH refuse, report the PRIMARY's
-      // refusal, not the fallback's. The fallback's refusal is a constant —
-      // it 406s us whatever we ask — so surfacing it replaces the one status
-      // that tells the caller what to do ("429, retry shortly") with an opaque
-      // HTML error page that reads as a malformed query. Observed exactly once
-      // while verifying #2036: kumi rate-limited a burst, and the call came
-      // back 406 from a host that had never been asked anything answerable.
-      res = HOST_REFUSED.has(fallbackRes.status) && primaryRes !== null
-        ? primaryRes
-        : fallbackRes;
-    } catch (e) {
-      // Both hosts are unreachable. Surface the PRIMARY's failure when it had
-      // one — it is the host we expect to serve us, so its symptom is the one
-      // worth reading — and the fallback's only when the primary had answered.
-      throw primaryThrew ?? e;
-    }
-  }
-  if (res === null) throw primaryThrew ?? new Error('Overpass: no response from either host.');
-  if (res.status === 429) {
-    throw new Error('Overpass: rate-limit (HTTP 429). Try again shortly or simplify the query.');
-  }
+  const { res, served_by } = await postOverpass((url, timeoutMs) => postTo(url, body, timeoutMs));
   if (res.status === 504) {
-    throw new Error('Overpass: query timed out (HTTP 504). Reduce the area or tighten filters.');
+    throw new Error(`Overpass: query timed out (HTTP 504 from ${served_by}). Reduce the area or tighten filters.`);
   }
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Overpass error: ${res.status} ${body.slice(0, 200)}`);
+    const text = await res.text();
+    throw new Error(`Overpass error: ${res.status} from ${served_by}: ${text.slice(0, 200)}`);
   }
   return res.json() as Promise<OverpassResponse>;
 }
