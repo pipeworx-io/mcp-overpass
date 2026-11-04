@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-overpass",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenStreetMap Overpass MCP — programmatic queries against the OSM database",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "overpass",
     "gatewaySlug": "overpass",
-    "sourceHash": "v1-8c02ed7c83765c4438973fadf874378358a5d50d1ac7c48d8b403df08454c579",
-    "sourceCommit": "6bae4cfa7b6a73bbe014dc8820a19c80c842b21e"
+    "sourceHash": "v1-95ffd934596c98d0a7326fcd19346a8f22e45795abc80835f26cc5e03978a6d6",
+    "sourceCommit": "243a06a6ca2d3b6075325f3b66a1468d0a2eb603"
   }
 }

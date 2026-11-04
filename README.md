@@ -2,7 +2,7 @@
 
 OpenStreetMap Overpass API MCP — programmatic OSM queries, no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1867+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -15,11 +15,11 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 Public Overpass instances, POST Overpass QL, JSON back. Tried in order, and a
 host that refuses or hangs is skipped for five minutes:
 
-1. `https://overpass.kumi.systems/api/interpreter` — fast when up; dark since
+1. OpenStreetMap Overpass API — fast when up; dark since
    ~2026-09-19 (hangs past 30s).
-2. `https://maps.mail.ru/osm/tools/overpass/api/interpreter` — full planet,
+2. OpenStreetMap Overpass API — full planet,
    current data, but 13-17s per call.
-3. `https://overpass-api.de/api/interpreter` — the canonical instance; 406s our
+3. OpenStreetMap Overpass API — the canonical instance; 406s our
    egress today (an IP block, fleet #2036), kept in case that changes.
 
 The order, the measurements and the mirrors ruled out live in
@@ -70,7 +70,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1856+ data sources. The
+Both URLs reach the same gateway and the same 1867+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
